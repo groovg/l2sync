@@ -1,52 +1,15 @@
-use futures_util::StreamExt;
-use serde::Deserialize;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-const WS_URL: &str = "wss://stream.binance.com:9443/ws/btcusdt@depth@100ms";
+use l2sync::binance;
+use l2sync::book::{Level, format_scaled};
+use l2sync::sync::{BookSync, DiffEvent};
 
-#[derive(Debug, Deserialize)]
-struct DepthDiff {
-    #[serde(rename = "E")]
-    event_time: u64,
-    #[serde(rename = "U")]
-    first_update_id: u64,
-    #[serde(rename = "u")]
-    final_update_id: u64,
-    #[serde(rename = "b")]
-    bids: Vec<[String; 2]>,
-    #[serde(rename = "a")]
-    asks: Vec<[String; 2]>,
-}
-
-fn best(levels: &[[String; 2]], want_max: bool) -> Option<&[String; 2]> {
-    let mut chosen: Option<(&[String; 2], f64)> = None;
-    for lvl in levels {
-        let Ok(qty) = lvl[1].parse::<f64>() else {
-            continue;
-        };
-        if qty <= 0.0 {
-            continue;
-        }
-        let Ok(px) = lvl[0].parse::<f64>() else {
-            continue;
-        };
-        let take = match chosen {
-            Some((_, cur)) => {
-                if want_max {
-                    px > cur
-                } else {
-                    px < cur
-                }
-            }
-            None => true,
-        };
-        if take {
-            chosen = Some((lvl, px));
-        }
-    }
-    chosen.map(|(lvl, _)| lvl)
-}
+const SYMBOL: &str = "BTCUSDT";
+const SNAPSHOT_DEPTH: u32 = 1000;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,31 +17,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .install_default()
         .expect("install rustls crypto provider");
 
-    let (mut ws, _) = connect_async(WS_URL).await?;
-    println!("connected {WS_URL}");
+    let mut sessions: u64 = 0;
+    loop {
+        if let Err(e) = run(SYMBOL).await {
+            sessions += 1;
+            eprintln!("session ended ({e}); reconnecting and resyncing [#{sessions}]");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
 
-    while let Some(frame) = ws.next().await {
-        let text = match frame? {
-            Message::Text(t) => t,
-            Message::Close(_) => break,
-            _ => continue,
-        };
-        let Ok(diff) = serde_json::from_str::<DepthDiff>(text.as_str()) else {
-            continue;
-        };
-        let (Some(bid), Some(ask)) = (best(&diff.bids, true), best(&diff.asks, false)) else {
-            continue;
-        };
-        println!(
-            "E={} U={} u={}  bid {} x {}  |  ask {} x {}",
-            diff.event_time,
-            diff.first_update_id,
-            diff.final_update_id,
-            bid[0],
-            bid[1],
-            ask[0],
-            ask[1],
-        );
+async fn run(symbol: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut ws, _) = connect_async(binance::stream_url(symbol)).await?;
+    println!("connected {symbol}; fetching snapshot");
+
+    let snapshot = binance::fetch_snapshot(symbol, SNAPSHOT_DEPTH);
+    tokio::pin!(snapshot);
+
+    let mut state = BookSync::new();
+    let mut buffered: Vec<DiffEvent> = Vec::new();
+    let mut have_snapshot = false;
+    let mut last_top: Option<(Level, Level)> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+            snap = &mut snapshot, if !have_snapshot => {
+                state.init(&snap?);
+                let pending = std::mem::take(&mut buffered);
+                for event in &pending {
+                    state.apply(event)?;
+                }
+                have_snapshot = true;
+                println!("snapshot applied (buffered diffs: {})", pending.len());
+                check_consistent(&state)?;
+                report(&state, &mut last_top);
+            }
+            frame = ws.next() => {
+                let Some(frame) = frame else {
+                    eprintln!("stream ended; reconnecting");
+                    return Ok(());
+                };
+                match frame? {
+                    Message::Text(text) => {
+                        let Some(event) = binance::parse_diff(text.as_str()) else { continue };
+                        if have_snapshot {
+                            state.apply(&event)?;
+                            check_consistent(&state)?;
+                            report(&state, &mut last_top);
+                        } else {
+                            buffered.push(event);
+                        }
+                    }
+                    Message::Ping(payload) => ws.send(Message::Pong(payload)).await?,
+                    Message::Close(_) => {
+                        eprintln!("server closed the stream; reconnecting");
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn check_consistent(state: &BookSync) -> Result<(), Box<dyn std::error::Error>> {
+    if state.is_synced() && state.book().crossed() {
+        return Err("maintained book crossed; resyncing".into());
     }
     Ok(())
+}
+
+fn report(state: &BookSync, last_top: &mut Option<(Level, Level)>) {
+    if !state.is_synced() {
+        return;
+    }
+    let (Some(bid), Some(ask)) = (state.book().best_bid(), state.book().best_ask()) else {
+        return;
+    };
+    if *last_top == Some((bid, ask)) {
+        return;
+    }
+    *last_top = Some((bid, ask));
+    let (bids, asks) = state.book().depth();
+    println!(
+        "bid {} x {}  |  ask {} x {}   [{bids}x{asks} levels]",
+        format_scaled(bid.0),
+        format_scaled(bid.1),
+        format_scaled(ask.0),
+        format_scaled(ask.1),
+    );
 }
