@@ -10,8 +10,9 @@ This is a feed-handler study: the parts that are actually hard in production —
 updates, sequence gaps, snapshot+diff synchronization, reconnects, and heterogeneous message
 formats, all under async backpressure.
 
-> **Status: early / work in progress.** The single-venue raw stream works; the book
-> synchronization that makes the data *correct* is next. Nothing here is production-ready yet.
+> **Status: work in progress.** A single Binance venue is fully synchronized (correct book,
+> gap detection, automatic resync). Multiple venues, a normalized model, and the consolidated
+> cross-venue view are next. Not production-ready yet.
 
 ## Why a depth feed is not "just apply every update"
 
@@ -20,64 +21,98 @@ carries only the levels that *changed* since the last one. The naive approach �
 diff stream and treat each event as the book — is silently wrong, because a single diff is not
 the book, only a delta against a snapshot you do not have yet.
 
-You can see it directly from the raw stream. Printing the best bid/ask *within each diff
-event* gives nonsense, because the highest bid present in one delta is not the real top of book:
+The difference is stark. Printing the best bid/ask *within each raw diff event* gives nonsense,
+because the highest bid present in one delta is not the real top of book:
 
 ```
-bid 59859.99 x 0.94701  |  ask 59860.00 x 1.65166     <- plausible
-bid 53874.00 x 0.58268  |  ask 59863.95 x 0.00009     <- a deep level happened to change
-bid 59859.99 x 0.96713  |  ask 79666.01 x 0.00133     <- an ask far from the touch changed
+# raw diff top-of-book (wrong)            # synchronized book (correct)
+bid 59859.99  | ask 59860.00              bid 59774.01 x 1.31 | ask 59774.02 x 4.13
+bid 53874.00  | ask 59863.95              bid 59774.01 x 1.63 | ask 59774.02 x 3.29
+bid 59859.99  | ask 79666.01              bid 59777.39 x 5.19 | ask 59777.40 x 0.05
 ```
 
-A correct book requires the documented handshake:
+The raw column jumps around because deep levels happen to change; the synchronized column holds
+a tight, correct one-cent spread. Getting from the left to the right requires the documented
+handshake:
 
 1. Open the diff stream and **buffer** events.
 2. Fetch the REST depth snapshot (it carries a `lastUpdateId`).
 3. Drop buffered diffs whose final id is `<= lastUpdateId`.
-4. Validate that the first kept diff brackets the snapshot id, then apply diffs in order.
-5. On any **sequence gap** (a diff whose first id is not contiguous with the last applied),
-   discard the book and resync from step 2.
+4. The first event to apply must bracket the snapshot: `U <= lastUpdateId + 1 <= u`. If the
+   stream has already moved past the snapshot (`U > lastUpdateId + 1`), the snapshot is stale —
+   refetch it.
+5. From then on each event must be contiguous (`U == previous u + 1`). Any **sequence gap**
+   discards the book and resyncs from step 2.
 
-Sequence semantics differ per venue (Binance `U`/`u`, Bybit `seq`, OKX checksum), so the
-handshake is abstracted behind a `Venue` trait rather than special-cased.
+Quantities are absolute, not deltas: a level is overwritten, or removed when its quantity is 0.
+Sequence semantics differ per venue (Binance `U`/`u`, Bybit `seq`, OKX checksum), so this
+handshake lives behind a small core (`book` + `sync`) that the venue adapters feed.
 
-## Roadmap
+## Correctness & testing
 
-- [x] Single Binance venue: depth-diff stream, `serde` parse, raw top of book.
-- [ ] Correct book sync: snapshot+diff handshake, sequence-gap detection, resync.
-- [ ] Multiple venues behind a common `Venue` trait (Bybit, OKX).
-- [ ] Normalized update/trade/snapshot model; exact fixed-point prices
-      ([`fixed-decimal`](https://github.com/groovg/fixed-decimal)), never floats.
-- [ ] Consolidated cross-venue BBO and crossed-market (arb) detection.
-- [ ] Tick-to-book latency percentiles, auto-reconnect with backoff, bounded-channel backpressure.
+The sync core is pure and synchronous, so it is tested without any network:
+
+- **Sequencing unit tests** (`tests/sequencing.rs`): stale-diff drop, snapshot bracketing,
+  rejection of a snapshot older than the stream, sequence-gap detection and recovery, absolute
+  quantity / zero-removal semantics, uncrossed-book invariant.
+- **Recorded-session replay** (`tests/replay_binance.rs`): a real Binance session (snapshot +
+  77 diff events + a second "verify" snapshot) is captured to `tests/fixtures/` by the
+  `record` binary and replayed deterministically in CI. The test asserts the handshake
+  succeeds, the continuous stream produces **zero gaps**, and the book never crosses.
+- **Differential check:** at the update id of the independently-fetched verify snapshot, the
+  maintained book's **top 40 levels** are compared against it. On the committed fixture they
+  match **exactly (0 mismatches)** — the snapshot+diff pipeline reproduces the exchange's own
+  top of book. Levels deeper than the REST snapshot's depth window are deliberately not
+  cross-checked: a depth-limited snapshot and the live diff stream naturally diverge in the far
+  tail (levels entering or leaving just inside the 1000-level boundary), which is expected, not
+  a sync error.
+
+Prices and quantities are parsed into exact scaled integers (no floating point), so levels and
+crosses are never corrupted by rounding.
 
 ## Build & run
 
 ```sh
-cargo run --release
+cargo run --release            # connect to Binance, print the synchronized BBO
+cargo run --bin record         # re-capture the test fixture from a live session
+cargo test                     # offline; runs against the committed fixture
 ```
 
-Connects to `btcusdt@depth@100ms` and streams the raw best bid/ask. Requires network access
-to Binance.
+The main binary connects to `btcusdt@depth@100ms`, performs the snapshot handshake, and prints
+the top of book whenever it changes. On a gap or disconnect it reconnects and resyncs. Requires
+network access to Binance.
 
 ## Design notes
 
-- **Async model:** one `tokio` task per venue connection, feeding a bounded `mpsc` to a single
-  book engine — backpressure instead of unbounded memory growth under a market burst.
-- **Book representation:** `BTreeMap<Price, Qty>` per side to start (simple and obviously
-  correct). A flat tick-indexed array is faster at the touch and is noted as a later swap.
-- **Prices:** kept as exchange-native strings for now; exact fixed-point once the normalized
-  model lands. Floats are deliberately avoided in the book — rounding produces mismatched levels
-  and phantom crosses.
+- **Book core:** `BTreeMap<Price, Qty>` per side — best bid is the last key, best ask the first.
+  Simple and obviously correct; a flat tick-indexed array would be faster at the touch and is a
+  later swap.
+- **Sync state machine:** a single `BookSync` owns the book, the last applied update id, and the
+  synced/resync state; the async shell only does I/O (WebSocket + REST) and feeds it events.
+- **Prices:** exchange-native decimal strings parsed to scaled `i64` ticks, exactly. Floats are
+  deliberately avoided — rounding produces mismatched levels and phantom crosses. (The shared
+  [`fixed-decimal`](https://github.com/groovg/fixed-decimal) type replaces the local scaled int
+  once the normalized multi-venue model lands.)
+- **Backpressure (planned):** the multi-venue shape is one `tokio` task per venue feeding a
+  bounded `mpsc` to a single book engine — bounded buffering instead of unbounded growth under a
+  burst. Today there is one venue and one task, so the channel is not wired yet.
 - **TLS:** rustls with the `ring` provider, so the build has no system OpenSSL dependency.
+
+## Roadmap
+
+- [x] Single Binance venue: depth-diff stream, snapshot+diff handshake, gap detection, resync.
+- [ ] Multiple venues behind a common `Venue` trait (Bybit, OKX) feeding one book engine.
+- [ ] Normalized update/trade/snapshot model; exact fixed-point prices, never floats.
+- [ ] Consolidated cross-venue BBO and crossed-market (arb) detection.
+- [ ] Tick-to-book latency percentiles, auto-reconnect with backoff, bounded-channel backpressure.
 
 ## Limitations (current)
 
 - Single venue (Binance), single hardcoded symbol.
-- No book synchronization yet — the current binary prints the *raw diff* top of book, which is
-  intentionally not the synchronized BBO (see above).
-- No reconnect / ping-pong handling yet.
-- No tests yet; deterministic replay-from-recording tests land with the sync work.
+- Resync on a gap reconnects the socket and refetches the snapshot — correct but heavier than
+  necessary (a lighter "keep the socket, refetch only" path is possible).
+- Reconnect uses a fixed delay, not yet exponential backoff with jitter.
+- No latency measurement yet.
 
 ## License
 
