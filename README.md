@@ -102,7 +102,7 @@ network access to Binance.
 
 - [x] Single Binance venue: depth-diff stream, snapshot+diff handshake, gap detection, resync.
 - [ ] Multiple venues behind a common `Venue` trait (Bybit, OKX) feeding one book engine.
-- [ ] Normalized update/trade/snapshot model; exact fixed-point prices, never floats.
+- [ ] Normalized update/trade/snapshot model; adopt the shared [`fixed-decimal`](https://github.com/groovg/fixed-decimal) price type (one scale across venues, replacing the local scaled int).
 - [ ] Consolidated cross-venue BBO and crossed-market (arb) detection.
 - [ ] Tick-to-book latency percentiles, auto-reconnect with backoff, bounded-channel backpressure.
 
